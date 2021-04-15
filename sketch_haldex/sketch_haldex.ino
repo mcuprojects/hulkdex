@@ -1,9 +1,11 @@
 #include <math.h>
-#include <Stepper.h>
+#include <A4988.h>
 #include <arduino-timer.h>
 
 // ======== CONFIG ========
-#define MOTOR_PINS 2, 3, 4, 5   // pins for stepper motor
+#define A4988_EN 2
+#define A4988_STEP 3
+#define A4988_DIR 4
 #define NTC_PIN A0              // temperature sensor pin
 #define NTC_GND A1              // temperature sensor ground pin
 #define RELAY_PIN 7             // pin for pump relay
@@ -11,11 +13,11 @@
 #define LED_PIN 9               // pin for status LED (near the button)
 
 #define MOTOR_STEPS 80          // ammount of motor rotation (generally don't need to edit this)
-#define ALARM_TEMP 25           // limit temperature at which the valve will be shut off automatically to prevent overheating
+#define ALARM_TEMP 95           // limit temperature at which the valve will be shut off automatically to prevent overheating
 //#define REVERSE_MOTOR         // uncomment to reverse motor direction
 //#define IGNORE_TEMP           // uncomment to disable temperature monitoring
 #define R_DIVIDER 2200.0        // upper resistor connected from NTC_PIN to VCC
-#define ON_TIME 10 * 1000      // time for turning on by short button press (in milliseconds)
+#define SHORT_ON_TIME 90 * 1000 //   time for turning on by short button press (in milliseconds)
 // ========================
 
 // NTC parameters (default values for stock Haldex thermistor)
@@ -26,7 +28,7 @@
 #define ADC_TO_R(adc) ((R_DIVIDER * adc) / (1023 - adc))
 #define R_TO_TEMP(r) ((NTC_T0 * NTC_B / (NTC_T0 * log((float)r/NTC_R0) + NTC_B)) - 275.0)
 
-Stepper motor(200, MOTOR_PINS);
+A4988 stepper(200, A4988_DIR, A4988_STEP);
 Timer<> timer = timer_create_default();
 Timer<>::Task btn_hold_task = NULL;
 Timer<>::Task awd_off_task = NULL;
@@ -36,14 +38,18 @@ bool alarm = false;
 bool prev_btn = false;
 bool new_key_press = false;
 
-// https://lastminuteengineers.com/a4988-stepper-motor-driver-arduino-tutorial/
-
 void setup()
 {
   Serial.begin(9600);
-  motor.setSpeed(120);
 
-  timer.every(400, alarm_check);
+  // 120 RPM / full-step mode
+  stepper.begin(120, 1);
+
+  // disable stepper
+  pinMode(A4988_EN, OUTPUT);
+  digitalWrite(A4988_EN, 1);
+
+  timer.in(400, alarm_check);
 }
 
 void loop()
@@ -78,7 +84,7 @@ void on_btn_release()
     timer.cancel(btn_hold_task);
     if (!alarm) {
       awd_on();
-      awd_off_task = timer.in(ON_TIME, awd_off);
+      awd_off_task = timer.in(SHORT_ON_TIME, awd_off);
     }
   } else if (awd_is_on == true) {
     if (new_key_press) {
@@ -119,7 +125,7 @@ void awd_off()
   awd_is_on = false;
 }
 
-bool alarm_check()
+void alarm_check()
 {
   alarm = !check_temp();
   
@@ -137,12 +143,15 @@ bool alarm_check()
         led_off();
   }
 
-  return true;  // for timer API
+  timer.in(400, alarm_check);
 }
 
 bool check_temp()
 {
 #ifndef IGNORE_TEMP
+  static int silent_counter = 0;
+  silent_counter = (silent_counter + 1) % 4;
+  
   // Enable ground pin for NTC
   pinMode(NTC_GND, OUTPUT);
   digitalWrite(NTC_GND, 0);
@@ -151,7 +160,8 @@ bool check_temp()
   // Read temperature
   int adc = analogRead(NTC_PIN);
   if (adc > 1020 || adc < 20) {
-    Serial.println("Temp: sensor not connected");
+    if (silent_counter == 0)
+      Serial.println("Temp: sensor not connected");
     return true;
   }
   float r = ADC_TO_R(adc);
@@ -162,7 +172,8 @@ bool check_temp()
     sprintf(buf, "Temp: %d C", (int)temp);
   else
     sprintf(buf, "Temp: %d C (overheat)", (int)temp);
-  Serial.println(buf);
+  if (silent_counter == 0)
+    Serial.println(buf);
   
   // Disable ground pin
   pinMode(NTC_GND, INPUT);
@@ -203,32 +214,28 @@ void pump_off()
 
 void valve_on()
 {
-#ifndef REVERSE_MOTOR
-  motor.step(MOTOR_STEPS);
+  // enable stepper
+  digitalWrite(A4988_EN, 0);
+
+#ifdef REVERSE_MOTOR
+  stepper.move(-MOTOR_STEPS);
 #else
-  motor.step(-MOTOR_STEPS);
+  stepper.move(MOTOR_STEPS);
 #endif
-
-  // release the motor (set all MOTOR_PINS to 0)
-  int pins[] = {MOTOR_PINS};
-  for (int i = 0; i < 4; i++)
-    digitalWrite(pins[i], 0);
-
+  
   Serial.println("valve ON");
 }
 
 void valve_off()
 {
-#ifndef REVERSE_MOTOR
-  motor.step(-MOTOR_STEPS);
+#ifdef REVERSE_MOTOR
+  stepper.move(MOTOR_STEPS);
 #else
-  motor.step(MOTOR_STEPS);
+  stepper.move(-MOTOR_STEPS);
 #endif
 
-  // release the motor (set all MOTOR_PINS to 0)
-  int pins[] = {MOTOR_PINS};
-  for (int i = 0; i < 4; i++)
-    digitalWrite(pins[i], 0);
+  // disable stepper
+  digitalWrite(A4988_EN, 1);
 
   Serial.println("valve OFF");
 }
